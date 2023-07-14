@@ -31,7 +31,7 @@ struct tuples
     unsigned char dest_cidr;
 };
 
-struct log
+struct flow
 {
     __u16 cookie;
     __u16 pkt_len;

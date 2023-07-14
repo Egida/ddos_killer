@@ -61,91 +61,67 @@ struct log_and_count
     struct log log;
 };
 
+struct lpm_v4_key
+{
+    __u32 prefixlen;
+    __u8 address[4];
+};
+
 const char *pin_basedir = "/sys/fs/bpf";
 static struct perf_event_mmap_page *headers[128];
 static int done = 0;
 static int pmu_fds[128];
 static int filter_settings_fd;
+static int threshold = 5000;
 
 void add_new_filter(struct settings *sourceinfo, int count)
 {
-    struct settings *buf = malloc(sizeof(struct settings));
-    memset(buf, 0, sizeof(struct settings));
-    __u32 key;
+    struct lpm_v4_key key;
+    key.prefixlen = 32;
+    memcpy(&key.address, &sourceinfo->data.ip_src, sizeof(key.address));
+    int value = 0;
+    bpf_map_update_elem(filter_settings_fd, &key, &value, BPF_ANY);
 
-    for (int i = 50; i < 550; i++)
+    struct in_addr in;
+    in.s_addr = sourceinfo->data.ip_src;
+    char *ip = inet_ntoa(in);
+
+    char *protocol;
+
+    if (sourceinfo->data.protocol == 17)
     {
-        key = i;
-        int in = bpf_map_lookup_elem(filter_settings_fd, &key, buf);
-
-        if (in < 0)
-        {
-            printf("Unable to access BPF Map");
-            return;
-        }
-
-        if (buf->data.ip_src == 0 && buf->data.ip_dest == 0 && buf->data.port_dest == 0 &&
-            buf->data.port_src == 0 && buf->data.protocol == 0)
-        {
-            int err = bpf_map_update_elem(filter_settings_fd, &key, sourceinfo, BPF_ANY);
-
-            struct in_addr in;
-            in.s_addr = sourceinfo->data.ip_src;
-            char *ip = inet_ntoa(in);
-
-            char *protocol;
-
-            if (sourceinfo->data.protocol == 17)
-            {
-                protocol = "UDP";
-            }
-            else if (sourceinfo->data.protocol == 6)
-            {
-                protocol = "TCP";
-            }
-            else if (sourceinfo->data.protocol == 1)
-            {
-                protocol = "ICMP";
-            }
-            else if (buf->data.protocol == 0)
-            {
-                protocol = "Not specified";
-            }
-            else
-            {
-                protocol = "Unknown";
-            }
-
-            if (err == -1)
-            {
-                printf("Unable to send filter data: IP %s Protocol %s Port %d\n", ip, protocol, sourceinfo->data.port_src);
-            }
-            else
-            {
-                struct timeval tv;
-                gettimeofday(&tv, NULL);
-                time_t ltime = tv.tv_sec;
-                struct tm *p;
-                struct tm buf;
-                char timestring[100];
-
-                if (NULL != (p = localtime_r(&ltime, &buf)))
-                {
-                    strftime(timestring, sizeof(timestring), "%c", p);
-                    printf("%s\n", timestring);
-                }
-                printf("Detected abnormal number of packets(%d). \nSending filter data: IP %s Protocol %s Port %d at index %d\n",
-                       count, ip, protocol, sourceinfo->data.port_src, key);
-            }
-            break;
-        }
-        else if (buf->data.ip_src == sourceinfo->data.ip_src && buf->data.ip_dest == sourceinfo->data.ip_dest &&
-                 buf->data.port_dest == sourceinfo->data.port_dest && buf->data.port_src == sourceinfo->data.port_src &&
-                 buf->data.protocol == sourceinfo->data.protocol)
-        {
-            break;
-        }
+        protocol = "UDP";
     }
+    else if (sourceinfo->data.protocol == 6)
+    {
+        protocol = "TCP";
+    }
+    else if (sourceinfo->data.protocol == 1)
+    {
+        protocol = "ICMP";
+    }
+    else if (sourceinfo->data.protocol == 0)
+    {
+        protocol = "Not specified";
+    }
+    else
+    {
+        protocol = "Unknown";
+    }
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    time_t ltime = tv.tv_sec;
+    struct tm *p;
+    struct tm buf;
+    char timestring[100];
+
+    if (NULL != (p = localtime_r(&ltime, &buf)))
+    {
+        strftime(timestring, sizeof(timestring), "%c", p);
+        printf("%s\n", timestring);
+    }
+    printf("Detected abnormal number of packets(%d). \nSending filter data: IP %s Protocol %s Port %d\n",
+           count, ip, protocol, sourceinfo->data.port_src, key);
 }
 
 static struct timeval last_log;
@@ -201,7 +177,7 @@ static int monitor_packets(void *data, int size)
 
     if (last_log.tv_sec + 1 <= tv.tv_sec)
     {
-        for (int i = 0; i < 1000; i++)
+        for (int i = 0; i < threshold; i++)
         {
             if (log_copy[i].log.cookie != 0)
             {
@@ -212,7 +188,9 @@ static int monitor_packets(void *data, int size)
                     s->state = 1;
                     add_new_filter(s, log_copy[i].count);
                 }
-            } else {
+            }
+            else
+            {
                 break;
             }
         }
@@ -257,7 +235,7 @@ static int monitor_packets(void *data, int size)
         }
         else
         {
-            printf(" IPv6: %s, Protocol: %s, Source port: %u, Destination Port: %u, length: %u %lu\n",
+            printf(" IPv6: %s, Protocol: %s, Source port: %u, Destination Port: %u, length: %u %llu\n",
                    ipv6_src, protocol, htons(e->data.port_src), htons(e->data.port_dest), e->pkt_len, e->ts_post - e->ts_pre);
         }
     }
@@ -348,7 +326,6 @@ int perf_event_poller_multi(int *fds, struct perf_event_mmap_page **headers,
     size_t len = 0;
     int i;
 
-    printf("%d", num_fds);
     pfds = calloc(num_fds, sizeof(*pfds));
     if (!pfds)
         return LIBBPF_PERF_EVENT_ERROR;
@@ -386,25 +363,28 @@ int main(int argc, char **argv)
     int interval = 5;
     char *device = malloc(256);
 
-    if (argc >= 2) {
+    if (argc >= 2)
+    {
         device = argv[1];
-    } else {
+    }
+    else
+    {
         printf("Please specify the network device.\n");
         return;
     }
-/*
-    for (int i = 1; i < argc; i++)
-    {
-        if (!strcmp(argv[i - 1], "--inv"))
+    /*
+        for (int i = 1; i < argc; i++)
         {
-            interval = atoi(argv[i]);
+            if (!strcmp(argv[i - 1], "--inv"))
+            {
+                interval = atoi(argv[i]);
+            }
+            else if (!strcmp(argv[i - 1], "--th"))
+            {
+                threshold = atoi(argv[i]);
+            }
         }
-        else if (!strcmp(argv[i - 1], "--th"))
-        {
-            threshold = atoi(argv[i]);
-        }
-    }
-*/
+    */
     struct bpf_map_info map_expect = {0};
     struct bpf_map_info info = {0};
     char pin_dir[4096];
@@ -419,7 +399,7 @@ int main(int argc, char **argv)
 
     char *directory = malloc(256);
     strcpy(directory, device);
-    strcat(directory, "/my_map");
+    strcat(directory, "/blacklist");
     filter_settings_fd = open_bpf_map_file(pin_dir, directory, &info);
     if (filter_settings_fd < 0)
     {

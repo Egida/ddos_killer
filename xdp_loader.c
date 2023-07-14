@@ -5,9 +5,6 @@ static const char *__doc__ = "XDP sample packet\n";
 #include <stdlib.h>
 #include <string.h>
 #include <linux/bpf.h>
-#include <net/if.h>
-#include <errno.h>
-#include <signal.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <sys/resource.h>
@@ -21,57 +18,36 @@ static const char *__doc__ = "XDP sample packet\n";
 #include <linux/if_ether.h>
 #include <linux/ipv6.h>
 #include <arpa/inet.h>
-#include <linux/icmpv6.h>
-#include <linux/icmp.h>
-#include <linux/udp.h>
-#include <linux/tcp.h>
 #include <time.h>
-#include <sys/time.h>
-#include <unistd.h>
-#include <assert.h>
-#include <poll.h>
-#include <linux/perf_event.h>
-#include <sys/mman.h>
+#include <math.h>
 
-#define SAMPLE_SIZE 1024
 #ifndef __packed
 #define __packed __attribute__((packed))
 #endif
 
-struct tuples
+struct flow
 {
-    uint8_t ip_version;
-    u_int32_t ip_src;
-    u_int32_t ip_dest;
-    struct in6_addr ip6_src;
-    struct in6_addr ip6_dest;
-    uint8_t protocol;
-    __u16 port_src;
-    __u16 port_dest;
-    u_int16_t icmp_sequence;
-    unsigned char source_cidr;
-    unsigned char dest_cidr;
-};
-
-struct log
-{
-	__u16 cookie;
-	__u16 pkt_len;
-	__u64 ts_pre;
-	__u64 ts_post;
-	struct tuples data;
+	u_int32_t ip_src;
+	u_int32_t ip_dest;
+	__u32 packet_count;
+	double entropy;
 } __packed;
 
-struct settings
+struct interval
 {
-	u_int32_t state;
-	struct tuples data;
+	struct flow flow[1000];
+} __packed;
+
+struct lpm_v4_key
+{
+	__u32 prefixlen;
+	__u32 address;
 };
 
-struct log_and_count
+struct metadata
 {
-    int count;
-    struct log log;
+	__u32 packet_count2;
+	__u32 packet_count;
 };
 
 static const struct option_wrapper long_options[] = {
@@ -110,7 +86,7 @@ struct bpf_object *__load_bpf_object_file(const char *filename, int ifindex)
 		.prog_type = BPF_PROG_TYPE_XDP,
 		.ifindex = ifindex,
 	};
-	prog_load_attr.file = "/home/mirai/ebpf_pfilt/ebpf_pfilt_adv/xdp_prog_kern.o";
+	prog_load_attr.file = "xdp_prog_kern.o";
 
 	err = bpf_prog_load_xattr(&prog_load_attr, &obj, &first_prog_fd);
 	if (err)
@@ -184,10 +160,9 @@ int pin_maps_in_bpf_object(struct bpf_object *bpf_obj, const char *subdir)
 	if (len < 0)
 	{
 		fprintf(stderr, "ERR: creating map_name\n");
-		return EXIT_FAIL_OPTION;
 	}
 
-	if (access(map_filename, F_OK) != -1)
+	if (access(map_filename, F_OK) == 0)
 	{
 		printf(" - Unpinning (remove) prev maps in %s/\n", pin_dir);
 
@@ -198,6 +173,7 @@ int pin_maps_in_bpf_object(struct bpf_object *bpf_obj, const char *subdir)
 			return EXIT_FAIL_BPF;
 		}
 	}
+
 	if (verbose)
 		printf(" - Pinning maps in %s/\n", pin_dir);
 
@@ -208,15 +184,173 @@ int pin_maps_in_bpf_object(struct bpf_object *bpf_obj, const char *subdir)
 	return 0;
 }
 
-static int filter_settings_fd;
+static int packet_count_alltime = 0;
+static int prev_packet_count = 0;
+static int cur_packet_count = 0;
+static int beta = 0;
 
+static int holder = 0;
+
+void calculate_entropy(int logger_fd, int blacklist_fd)
+{
+	struct interval *invl_prev = malloc(sizeof(struct interval));
+	int key_invl = 0;
+	int e = bpf_map_lookup_elem(logger_fd, &key_invl, invl_prev);
+	if (e == -1)
+	{
+		printf("Error in fetching log data\n");
+		return;
+	}
+
+	struct interval *invl_cur = malloc(sizeof(struct interval));
+	key_invl = 1;
+	e = bpf_map_lookup_elem(logger_fd, &key_invl, invl_cur);
+	if (e == -1)
+	{
+		printf("Error in fetching log data\n");
+		return;
+	}
+
+	// Refresh the log to accept new data
+	struct interval *invl_new = malloc(sizeof(struct interval));
+	key_invl = 1;
+	bpf_map_update_elem(logger_fd, &key_invl, invl_new, BPF_ANY);
+
+	// implement code to calculate based on fast entropy approach
+	double value = 0.0;
+	double tau = 0.0;
+	printf("==Interval==\n");
+	for (int num_of_flow = 0; num_of_flow < 1000; num_of_flow++)
+	{
+		if (invl_prev->flow[num_of_flow].packet_count != 0)
+		{
+			cur_packet_count += invl_prev->flow[num_of_flow].packet_count;
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	// int average_packet_per_flow = cur_packet_count / num_of_flow;
+
+	for (int i = 0; i < 1000; i++)
+	{
+		if (invl_prev->flow[i].packet_count != 0)
+		{
+			packet_count_alltime += invl_prev->flow[i].packet_count;
+			double p = (double)invl_prev->flow[i].packet_count / cur_packet_count; //(metadata->packet_count);
+			value = -1 * log10(p);
+			int next_int_packet_count = 0;
+			for (int j = 0; j < 1000; j++)
+			{
+				if (invl_prev->flow[i].ip_src == invl_cur->flow[j].ip_src)
+				{
+					if (invl_prev->flow[i].ip_src >= invl_prev->flow[j].ip_src)
+					{
+						next_int_packet_count = invl_cur->flow[j].packet_count;
+						tau = log10((double)invl_cur->flow[j].packet_count / next_int_packet_count);
+						break;
+					}
+					else
+					{
+						next_int_packet_count = invl_cur->flow[j].packet_count;
+						tau = log10((double)next_int_packet_count / invl_cur->flow[j].packet_count);
+						break;
+					}
+				}
+			}
+			// Printing the entropy values
+			struct in_addr in;
+			in.s_addr = invl_prev->flow[i].ip_src;
+			char *ip = inet_ntoa(in);
+			if (tau < 0)
+			{
+				tau = -1 * tau;
+			}
+			invl_prev->flow[i].entropy = value + tau;
+			printf("IP:%s prv: %d cur: %d etp:%f\n", ip, invl_prev->flow[i].packet_count, next_int_packet_count, invl_prev->flow[i].entropy);
+			holder += invl_prev->flow[i].packet_count;
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	double avg_entropy = 0.0;
+	double sum_of_entropy = 0.0;
+	int num_of_flow = 0;
+	for (num_of_flow = 0; num_of_flow < 1000; num_of_flow++)
+	{
+		if (invl_prev->flow[num_of_flow].packet_count != 0)
+		{
+			sum_of_entropy += invl_prev->flow[num_of_flow].entropy;
+		}
+		else
+		{
+			break;
+		}
+	}
+	avg_entropy = sum_of_entropy / num_of_flow;
+	double deviation = 0.0;
+
+	for (int i = 0; i <= num_of_flow; i++)
+	{
+		deviation += abs(invl_prev->flow[i].entropy - avg_entropy) * abs(invl_prev->flow[i].entropy - avg_entropy);
+	}
+
+	double std_deviation = sqrt(deviation / (double)num_of_flow);
+	printf("calculated standard deviation %f\n", std_deviation);
+
+	for (int i = 0; i <= num_of_flow; i++)
+	{
+		if (invl_prev->flow[i].entropy > 1.5 * avg_entropy)
+		{
+			beta++;
+		}
+		else if (invl_prev->flow[i].entropy < 0.5 * avg_entropy)
+		{
+			beta--;
+		}
+
+		if (abs(avg_entropy - invl_prev->flow[i].entropy) > beta * std_deviation)
+		{
+			struct lpm_v4_key *key = malloc(sizeof(struct lpm_v4_key));
+			key->prefixlen = 32;
+			key->address = invl_prev->flow[i].ip_src;
+			int i = 0;
+
+			struct in_addr in;
+			in.s_addr = invl_prev->flow[i].ip_src;
+			char *ip = inet_ntoa(in);
+
+			int e = bpf_map_update_elem(blacklist_fd, key, &i, BPF_NOEXIST);
+			if (e < 0)
+			{
+				printf("Adding new filter settings failed IP: %s\n", ip);
+			}
+			else
+			{
+				printf("Blocked IP: %s\n", ip);
+			}
+		}
+	}
+
+	cur_packet_count = 0;
+	//  copy invl->intervals[1] to invl->intervals[0], and update bpf map
+	memcpy(invl_prev, invl_cur, sizeof(struct interval));
+	key_invl = 0;
+	bpf_map_update_elem(logger_fd, &key_invl, invl_prev, BPF_ANY);
+}
 
 int main(int argc, char **argv)
 {
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	struct bpf_object *obj;
-	struct bpf_map *map;
 	struct bpf_map *logger;
+	struct bpf_map *blacklist;
+	struct bpf_map *data;
 	char filename[256];
 	struct config cfg = {
 		.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_DRV_MODE,
@@ -224,64 +358,6 @@ int main(int argc, char **argv)
 		.do_unload = false,
 	};
 	char *default_progsec = "xdp_filter";
-
-	int udefupdated = 0;
-
-	struct settings *udef = (struct settings *)malloc(sizeof(struct settings));
-
-	for (int i = 1; i < argc; i++)
-	{
-		if (!strcmp(argv[i], "--udef"))
-		{
-			udef->data.port_src = 0;
-			udef->data.protocol = 0;
-			udef->data.ip_src = 0;
-			udef->state = 1;
-
-			for (int r = i + 1; r < argc - 1; r++)
-			{
-				if (!strcmp(argv[r], "ip") && r + 1 < argc)
-				{
-					struct in_addr temp;
-					int err = inet_aton(argv[r + 1], &temp);
-					if (err == 0)
-					{
-						printf("Unable to read the IP address. Please check if the IP address is valid.");
-						return 0;
-					}
-					udef->data.ip_src = temp.s_addr;
-					udefupdated++;
-					break;
-				}
-				else if (!strcmp(argv[r], "protocol") && r + 2 < argc)
-				{
-					if (!strcmp(argv[r + 1], "udp"))
-					{
-						udef->data.protocol = 17;
-						udef->data.port_src = atoi(argv[r + 2]);
-						udefupdated++;
-					}
-					else if (!strcmp(argv[r + 1], "tcp"))
-					{
-						udef->data.protocol = 6;
-						udef->data.port_src = atoi(argv[r + 2]);
-						udefupdated++;
-					}
-					else if (!strcmp(argv[r + 1], "icmp"))
-					{
-						udef->data.protocol = 1;
-						udefupdated++;
-					}
-				}
-				else
-				{
-					printf("Please specify the IP address, protocol, or port.");
-					return 0;
-				}
-			}
-			break;
-		}
-	}
 
 	strncpy(cfg.progsec, default_progsec, sizeof(cfg.progsec));
 
@@ -313,26 +389,41 @@ int main(int argc, char **argv)
 
 	pin_maps_in_bpf_object(obj, cfg.ifname);
 
-	map = bpf_map__next(NULL, obj);
-	if (!map)
-	{
-		printf("finding a map in obj file failed\n");
-		return 1;
-	}
-	filter_settings_fd = bpf_map__fd(map);
-
-	if (udefupdated != 0)
-	{
-		printf("Sending user defined filter data\n");
-		__u32 key = 50;
-		bpf_map_update_elem(filter_settings_fd, &key, udef, 0);
-	}
-
-	int logger_fd = 0;
-	logger = bpf_map__next(map, obj);
+	logger = bpf_map__next(NULL, obj);
 	if (!logger)
 	{
 		printf("finding a map in obj file failed\n");
 		return 1;
+	}
+	int logger_fd = bpf_map__fd(logger);
+
+	blacklist = bpf_map__next(logger, obj);
+	if (!blacklist)
+	{
+		printf("finding a map in obj file failed\n");
+		return 1;
+	}
+	int blacklist_fd = bpf_map__fd(blacklist);
+
+	/*int data_fd = 0;
+	data = bpf_map__next(blacklist, obj);
+	if (!data)
+	{
+		printf("finding a map in obj file failed\n");
+		return 1;
+	}*/
+	int count = 0;
+
+	while (1)
+	{
+		sleep(1);
+		calculate_entropy(logger_fd, blacklist_fd);
+		count++;
+		if (count == 10)
+		{
+			printf("Roudup of past 10 seconds %d\n", holder);
+			count = 0;
+			holder = 0;
+		}
 	}
 }
